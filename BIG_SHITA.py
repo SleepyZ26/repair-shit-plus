@@ -6,7 +6,7 @@ import re
 from io import BytesIO
 
 st.set_page_config(page_title="统一维修分析平台", layout="wide")
-st.title("🔧 统一维修分析平台 v1")
+st.title("🔧 统一维修分析平台 v1（稳定版）")
 
 
 # =========================================================
@@ -95,16 +95,21 @@ def safe_ratio(series):
 
 def find_column(df, candidates):
     cols = [normalize_colname(c) for c in df.columns]
+
+    # 先精确匹配
     for cand in candidates:
         cand_n = normalize_colname(cand)
         for c in cols:
             if cand_n == c:
                 return c
+
+    # 再模糊包含
     for cand in candidates:
         cand_n = normalize_colname(cand)
         for c in cols:
             if cand_n in c:
                 return c
+
     return None
 
 
@@ -122,18 +127,28 @@ def find_replaced_sku_columns(df):
 def load_uploaded_file(uploaded_file):
     if uploaded_file.name.lower().endswith(".csv"):
         return {"single_csv": pd.read_csv(uploaded_file)}, ["single_csv"]
+
     xls = pd.ExcelFile(uploaded_file)
-    sheets = {s: pd.read_excel(uploaded_file, sheet_name=s) for s in xls.sheet_names}
-    return sheets, xls.sheet_names
+    sheets = {}
+    for s in xls.sheet_names:
+        sheets[str(s)] = pd.read_excel(uploaded_file, sheet_name=s)
+    return sheets, [str(s) for s in xls.sheet_names]
 
 
 def to_excel_download(data_dict):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for sheet_name, df in data_dict.items():
-            if df is not None and isinstance(df, pd.DataFrame):
-                df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+            if isinstance(df, pd.DataFrame):
+                safe_name = str(sheet_name)[:31] if str(sheet_name).strip() else "sheet"
+                df.to_excel(writer, index=False, sheet_name=safe_name)
     return output.getvalue()
+
+
+def empty_df(columns=None):
+    if columns is None:
+        columns = []
+    return pd.DataFrame(columns=columns)
 
 
 # =========================================================
@@ -179,6 +194,7 @@ def load_sku_mapping(uploaded_sku_file):
         sku_map_df["中文名称"] = sku_map_df["中文名称"].astype(str).str.strip()
         sku_map_df = sku_map_df.dropna(subset=["SKU"])
         sku_map_df = sku_map_df[["SKU", "中文名称"]].drop_duplicates(subset=["SKU"])
+
         return sku_map_df
 
     except Exception as e:
@@ -188,7 +204,7 @@ def load_sku_mapping(uploaded_sku_file):
 
 def attach_sku_name(df_sku_result, sku_map_df):
     if df_sku_result is None or df_sku_result.empty:
-        return df_sku_result
+        return df_sku_result.copy() if isinstance(df_sku_result, pd.DataFrame) else pd.DataFrame()
 
     result = df_sku_result.copy()
     if "SKU" in result.columns:
@@ -208,19 +224,16 @@ def attach_sku_name(df_sku_result, sku_map_df):
 # 模板识别
 # =========================================================
 def detect_template(sheets, sheet_names):
-    normalized_sheet_names = [s.strip().lower() for s in sheet_names]
+    normalized_sheet_names = [str(s).strip().lower() for s in sheet_names]
 
-    # AVONO multisheet
     avono_keys = {"repair report", "additional activity", "ow"}
     if avono_keys.issubset(set(normalized_sheet_names)):
         return "avono_multisheet"
 
-    # NAVEE service report
     navee_keys = {"pcs", "labor", "spareparts"}
     if navee_keys.issubset(set(normalized_sheet_names)):
         return "navee_service_report"
 
-    # generic single/other
     return "generic_report"
 
 
@@ -281,7 +294,7 @@ def normalize_activity_name(activity):
 
 def parse_avono_overview(df_raw):
     if df_raw is None or df_raw.empty:
-        return pd.DataFrame(columns=["position", "quantity", "price"])
+        return empty_df(["position", "quantity", "price"])
 
     df = df_raw.copy()
     header_idx = None
@@ -363,9 +376,11 @@ def parse_avono_repair_report(df_raw):
         df[col] = normalize_text_series(df[col])
 
     df["sn"] = df["sn"].fillna("").astype(str).str.strip()
-    df["total_cost"] = df["repair_fee"] + df["shipping_fee"] + df["resend_shipping_fee"] + df["scrap_fee"] + df["other_fee"]
+    df["total_cost"] = (
+        df["repair_fee"] + df["shipping_fee"] + df["resend_shipping_fee"] + df["scrap_fee"] + df["other_fee"]
+    )
     df["TAT"] = df.apply(lambda r: calc_tat(r, "received_date", "shipment_date"), axis=1)
-    df = df.sort_values(by=["sn", "received_date"], na_position="last")
+    df = df.sort_values(by=["sn", "received_date"], na_position="last").copy()
     df["repeat"] = df.duplicated(subset=["sn"], keep="first")
     df["agent"] = df.apply(lambda r: map_agent_repair_report(r.get("sales_channel"), r.get("model")), axis=1)
 
@@ -411,41 +426,48 @@ def parse_avono_ow(df_raw):
 
 
 def parse_avono_template(sheets, sheet_names):
-    sheet_map = {s.strip().lower(): s for s in sheet_names}
+    sheet_map = {str(s).strip().lower(): str(s) for s in sheet_names}
 
-    overview_raw = sheets.get(sheet_map.get("übersicht")) or sheets.get(sheet_map.get("ubersicht"))
-    repair_raw = sheets.get(sheet_map.get("repair report"))
-    add_raw = sheets.get(sheet_map.get("additional activity"))
-    ow_raw = sheets.get(sheet_map.get("ow"))
+    overview_raw = sheets[sheet_map["übersicht"]] if "übersicht" in sheet_map else None
+    if overview_raw is None and "ubersicht" in sheet_map:
+        overview_raw = sheets[sheet_map["ubersicht"]]
+
+    repair_raw = sheets[sheet_map["repair report"]] if "repair report" in sheet_map else None
+    add_raw = sheets[sheet_map["additional activity"]] if "additional activity" in sheet_map else None
+    ow_raw = sheets[sheet_map["ow"]] if "ow" in sheet_map else None
+
     doa_raw = None
     for s in sheet_names:
-        if "doa report" in s.strip().lower():
-            doa_raw = sheets[s]
+        if "doa report" in str(s).strip().lower():
+            doa_raw = sheets[str(s)]
             break
 
-    overview_df = parse_avono_overview(overview_raw) if overview_raw is not None else pd.DataFrame()
-    repairs_df = parse_avono_repair_report(repair_raw) if repair_raw is not None else pd.DataFrame()
-    activity_all_df, activity_df = parse_avono_additional_activity(add_raw) if add_raw is not None else (pd.DataFrame(), pd.DataFrame())
-    ow_df = parse_avono_ow(ow_raw) if ow_raw is not None else pd.DataFrame()
-    doa_df = doa_raw.copy() if doa_raw is not None else pd.DataFrame()
+    overview_df = parse_avono_overview(overview_raw) if overview_raw is not None else empty_df(["position", "quantity", "price"])
+    repairs_df = parse_avono_repair_report(repair_raw) if repair_raw is not None else empty_df()
+    activity_all_df, activity_df = (
+        parse_avono_additional_activity(add_raw) if add_raw is not None else (empty_df(), empty_df())
+    )
+    ow_df = parse_avono_ow(ow_raw) if ow_raw is not None else empty_df()
+    doa_df = doa_raw.copy() if isinstance(doa_raw, pd.DataFrame) else empty_df()
 
-    parts_df = pd.DataFrame()
+    parts_df = empty_df()
     if not repairs_df.empty:
         sku_columns = find_replaced_sku_columns(repairs_df)
         if sku_columns:
-            parts_df = repairs_df[["repair_id", "order_id", "model", "sn", "agent"] + sku_columns].copy()
+            keep_cols = [c for c in ["repair_id", "order_id", "model", "sn", "agent"] if c in repairs_df.columns]
+            parts_df = repairs_df[keep_cols + sku_columns].copy()
             parts_df = parts_df.melt(
-                id_vars=["repair_id", "order_id", "model", "sn", "agent"],
+                id_vars=keep_cols,
                 value_vars=sku_columns,
                 value_name="SKU"
             )
             parts_df["SKU"] = parts_df["SKU"].apply(normalize_sku_value)
-            parts_df = parts_df.dropna(subset=["SKU"])
+            parts_df = parts_df.dropna(subset=["SKU"]).copy()
             parts_df["qty"] = 1
 
     meta_info = {
         "template_name": "avono_multisheet",
-        "sheet_names": sheet_names,
+        "sheet_names": [str(s) for s in sheet_names],
         "notes": []
     }
 
@@ -501,7 +523,10 @@ def parse_navee_pcs(df_raw):
 
     df["received_date"] = pd.to_datetime(df["received_date"], errors="coerce")
     df["shipment_date"] = pd.to_datetime(df["shipment_date"], errors="coerce")
-    df["purchase_date"] = pd.to_datetime(df.get("purchase_date"), errors="coerce")
+    if "purchase_date" in df.columns:
+        df["purchase_date"] = pd.to_datetime(df["purchase_date"], errors="coerce")
+    else:
+        df["purchase_date"] = pd.NaT
 
     for col in ["model", "sn", "battery_sn", "issue_desc", "issue_desc_en", "issue_detail", "partner", "state"]:
         df[col] = normalize_text_series(df[col])
@@ -514,10 +539,9 @@ def parse_navee_pcs(df_raw):
     df["technician"] = "未知"
     df["total_cost"] = 0
     df["TAT"] = df.apply(lambda r: calc_tat(r, "received_date", "shipment_date"), axis=1)
-    df = df.sort_values(by=["sn", "received_date"], na_position="last")
+    df = df.sort_values(by=["sn", "received_date"], na_position="last").copy()
     df["repeat"] = df.duplicated(subset=["sn"], keep="first")
 
-    # 同一 RMA 可能多条 defect_eng，汇总成 repair 主表
     group_cols = [
         "repair_id", "repair_sub_id", "model", "sn", "battery_sn", "received_date", "shipment_date",
         "purchase_date", "partner", "state", "repair_type", "country", "customer_name",
@@ -592,15 +616,16 @@ def parse_navee_spareparts(df_raw):
 
 
 def parse_navee_template(sheets, sheet_names):
-    pcs_raw = sheets[[s for s in sheet_names if s.strip().lower() == "pcs"][0]]
-    labor_raw = sheets[[s for s in sheet_names if s.strip().lower() == "labor"][0]]
-    parts_raw = sheets[[s for s in sheet_names if s.strip().lower() == "spareparts"][0]]
+    sheet_map = {str(s).strip().lower(): str(s) for s in sheet_names}
+
+    pcs_raw = sheets[sheet_map["pcs"]] if "pcs" in sheet_map else empty_df()
+    labor_raw = sheets[sheet_map["labor"]] if "labor" in sheet_map else empty_df()
+    parts_raw = sheets[sheet_map["spareparts"]] if "spareparts" in sheet_map else empty_df()
 
     repairs_df, pcs_detail_df = parse_navee_pcs(pcs_raw)
     labor_df = parse_navee_labor(labor_raw)
     parts_df = parse_navee_spareparts(parts_raw)
 
-    # labor 汇总进 repairs
     labor_summary = labor_df.groupby(["repair_id", "repair_sub_id"], dropna=False).agg(
         labor_cost=("labor_price", "sum"),
         labor_names=("labor_name", lambda x: " | ".join(pd.Series(x).dropna().astype(str).unique()))
@@ -610,14 +635,13 @@ def parse_navee_template(sheets, sheet_names):
     repairs_df["labor_cost"] = repairs_df["labor_cost"].fillna(0)
     repairs_df["total_cost"] = repairs_df["labor_cost"]
 
-    # parts 关联 model/sn/agent
-    parts_df = parts_df.merge(
-        repairs_df[["repair_id", "repair_sub_id", "model", "sn", "agent"]],
-        on=["repair_id", "repair_sub_id"],
-        how="left"
-    )
+    if not parts_df.empty:
+        parts_df = parts_df.merge(
+            repairs_df[["repair_id", "repair_sub_id", "model", "sn", "agent"]],
+            on=["repair_id", "repair_sub_id"],
+            how="left"
+        )
 
-    # orders
     orders_df = repairs_df[[
         "repair_id", "repair_sub_id", "model", "sn", "agent",
         "received_date", "shipment_date", "repair_type", "total_cost"
@@ -631,7 +655,7 @@ def parse_navee_template(sheets, sheet_names):
 
     meta_info = {
         "template_name": "navee_service_report",
-        "sheet_names": sheet_names,
+        "sheet_names": [str(s) for s in sheet_names],
         "notes": []
     }
 
@@ -639,12 +663,12 @@ def parse_navee_template(sheets, sheet_names):
         "template_name": "navee_service_report",
         "repairs_df": repairs_df,
         "parts_df": parts_df,
-        "activity_df": pd.DataFrame(),
-        "activity_all_df": pd.DataFrame(),
+        "activity_df": empty_df(),
+        "activity_all_df": empty_df(),
         "finance_df": finance_df,
         "orders_df": orders_df,
         "overview_df": finance_df,
-        "doa_df": pd.DataFrame(),
+        "doa_df": empty_df(),
         "labor_df": labor_df,
         "pcs_detail_df": pcs_detail_df,
         "meta_info": meta_info
@@ -655,7 +679,7 @@ def parse_navee_template(sheets, sheet_names):
 # 通用模板解析
 # =========================================================
 def parse_generic_template(sheets, sheet_names):
-    first_sheet_name = sheet_names[0]
+    first_sheet_name = str(sheet_names[0])
     df = safe_columns(sheets[first_sheet_name].copy())
 
     model_col = find_column(df, ["model", "equipment"])
@@ -692,12 +716,11 @@ def parse_generic_template(sheets, sheet_names):
 
     repairs_df["total_cost"] = to_numeric_safe(df[price_col], default=0) if price_col else 0
     repairs_df["TAT"] = repairs_df.apply(lambda r: calc_tat(r, "received_date", "shipment_date"), axis=1)
-    repairs_df = repairs_df.sort_values(by=["sn", "received_date"], na_position="last")
+    repairs_df = repairs_df.sort_values(by=["sn", "received_date"], na_position="last").copy()
     repairs_df["repeat"] = repairs_df.duplicated(subset=["sn"], keep="first")
 
-    # parts
     sku_cols = [c for c in df.columns if "sku" in c]
-    parts_df = pd.DataFrame()
+    parts_df = empty_df()
     if sku_cols:
         tmp = df[[order_col] + sku_cols].copy() if order_col else df[sku_cols].copy()
         if order_col:
@@ -707,7 +730,7 @@ def parse_generic_template(sheets, sheet_names):
 
         parts_df = tmp.melt(id_vars=["repair_id"], value_vars=sku_cols, value_name="SKU")
         parts_df["SKU"] = parts_df["SKU"].apply(normalize_sku_value)
-        parts_df = parts_df.dropna(subset=["SKU"])
+        parts_df = parts_df.dropna(subset=["SKU"]).copy()
         parts_df["qty"] = 1
         parts_df = parts_df.merge(repairs_df[["repair_id", "model", "sn", "agent"]], on="repair_id", how="left")
 
@@ -719,7 +742,7 @@ def parse_generic_template(sheets, sheet_names):
 
     meta_info = {
         "template_name": "generic_report",
-        "sheet_names": sheet_names,
+        "sheet_names": [str(s) for s in sheet_names],
         "notes": [f"按通用模板解析：{first_sheet_name}"]
     }
 
@@ -727,12 +750,12 @@ def parse_generic_template(sheets, sheet_names):
         "template_name": "generic_report",
         "repairs_df": repairs_df,
         "parts_df": parts_df,
-        "activity_df": pd.DataFrame(),
-        "activity_all_df": pd.DataFrame(),
+        "activity_df": empty_df(),
+        "activity_all_df": empty_df(),
         "finance_df": finance_df,
         "orders_df": repairs_df.copy(),
         "overview_df": finance_df,
-        "doa_df": pd.DataFrame(),
+        "doa_df": empty_df(),
         "meta_info": meta_info
     }
 
@@ -755,9 +778,16 @@ def parse_report(sheets, sheet_names):
 def render_header_info(parsed):
     st.subheader("🧭 识别结果")
     c1, c2 = st.columns([1, 2])
-    c1.metric("识别模板", parsed["template_name"])
-    c2.write("检测到的 Sheets：", " / ".join(parsed["meta_info"].get("sheet_names", [])))
-    notes = parsed["meta_info"].get("notes", [])
+
+    template_name = str(parsed.get("template_name", "unknown"))
+    sheet_names = parsed.get("meta_info", {}).get("sheet_names", [])
+    sheet_names = [str(s) for s in sheet_names if pd.notna(s)]
+    sheet_text = " / ".join(sheet_names) if sheet_names else "未检测到"
+
+    c1.metric("识别模板", template_name)
+    c2.markdown(f"**检测到的 Sheets：** {sheet_text}")
+
+    notes = parsed.get("meta_info", {}).get("notes", [])
     if notes:
         for n in notes:
             st.caption(f"- {n}")
@@ -780,8 +810,14 @@ def render_sidebar_filters(repairs_df):
     model_filter = st.sidebar.multiselect("Model", model_vals, default=model_vals)
     agent_filter = st.sidebar.multiselect("代理/客户", agent_vals, default=agent_vals)
 
-    min_date = df["received_date"].min() if "received_date" in df.columns and df["received_date"].notna().any() else pd.Timestamp.today()
-    max_date = df["received_date"].max() if "received_date" in df.columns and df["received_date"].notna().any() else pd.Timestamp.today()
+    if "received_date" in df.columns and df["received_date"].notna().any():
+        min_date = df["received_date"].min()
+        max_date = df["received_date"].max()
+    else:
+        today = pd.Timestamp.today().normalize()
+        min_date = today
+        max_date = today
+
     date_range = st.sidebar.date_input("日期范围", [min_date, max_date])
 
     if country_vals:
@@ -792,11 +828,18 @@ def render_sidebar_filters(repairs_df):
         df = df[df["model"].isin(model_filter)]
     if agent_vals:
         df = df[df["agent"].isin(agent_filter)]
+
     if isinstance(date_range, (list, tuple)) and len(date_range) == 2 and "received_date" in df.columns:
-        df = df[
-            (df["received_date"] >= pd.to_datetime(date_range[0])) &
-            (df["received_date"] <= pd.to_datetime(date_range[1]))
-        ]
+        start_date = pd.to_datetime(date_range[0], errors="coerce")
+        end_date = pd.to_datetime(date_range[1], errors="coerce")
+        if pd.notna(start_date) and pd.notna(end_date):
+            df = df[
+                (df["received_date"].isna()) |
+                (
+                    (df["received_date"] >= start_date) &
+                    (df["received_date"] <= end_date)
+                )
+            ]
 
     return df
 
@@ -805,8 +848,8 @@ def render_overview_tab(parsed, repairs_df_filtered):
     st.subheader("📊 总览")
 
     repairs_df = repairs_df_filtered.copy()
-    finance_df = parsed.get("finance_df", pd.DataFrame()).copy()
-    overview_df = parsed.get("overview_df", pd.DataFrame()).copy()
+    finance_df = parsed.get("finance_df", empty_df()).copy()
+    overview_df = parsed.get("overview_df", empty_df()).copy()
 
     total_repairs = len(repairs_df)
     avg_tat = repairs_df["TAT"].dropna().mean() if "TAT" in repairs_df.columns and not repairs_df.empty else 0
@@ -821,7 +864,7 @@ def render_overview_tab(parsed, repairs_df_filtered):
     c4.metric("重复维修率", f"{repeat_rate:.1%}")
     c5.metric("DOA占比", f"{doa_rate:.1%}")
 
-    if parsed["template_name"] == "avono_multisheet" and not overview_df.empty:
+    if parsed["template_name"] == "avono_multisheet" and not overview_df.empty and {"position", "price"}.issubset(overview_df.columns):
         def get_price(keyword):
             mask = overview_df["position"].astype(str).str.strip().str.lower() == keyword.lower()
             return overview_df.loc[mask, "price"].sum() if mask.any() else 0
@@ -918,13 +961,14 @@ def render_repairs_tab(repairs_df_filtered):
             use_container_width=True
         )
 
-        agent_model = (
-            df.groupby(["agent", "model"], dropna=False)
-            .size()
-            .reset_index(name="count")
-            .sort_values(["agent", "count"], ascending=[True, False])
-        )
-        a2.dataframe(agent_model.head(50), use_container_width=True)
+        if "model" in df.columns:
+            agent_model = (
+                df.groupby(["agent", "model"], dropna=False)
+                .size()
+                .reset_index(name="count")
+                .sort_values(["agent", "count"], ascending=[True, False])
+            )
+            a2.dataframe(agent_model.head(50), use_container_width=True)
 
     st.subheader("📦 Model 分析")
     m1, m2 = st.columns(2)
@@ -1005,6 +1049,11 @@ def render_parts_tab(parts_df, sku_map_df):
     if "qty" not in df.columns:
         df["qty"] = 1
 
+    if "SKU" not in df.columns:
+        st.info("当前备件表没有 SKU 字段。")
+        st.dataframe(df, use_container_width=True)
+        return
+
     sku_top = (
         df.groupby("SKU", dropna=False)["qty"]
         .sum()
@@ -1059,8 +1108,8 @@ def render_parts_tab(parts_df, sku_map_df):
 
 def render_activity_tab(parsed):
     st.subheader("📦 Additional Activity / 附加活动分析")
-    activity_all_df = parsed.get("activity_all_df", pd.DataFrame()).copy()
-    activity_df = parsed.get("activity_df", pd.DataFrame()).copy()
+    activity_all_df = parsed.get("activity_all_df", empty_df()).copy()
+    activity_df = parsed.get("activity_df", empty_df()).copy()
 
     if activity_all_df.empty and activity_df.empty:
         st.info("当前报告未识别到 Additional Activity 数据。")
@@ -1096,13 +1145,17 @@ def render_activity_tab(parsed):
         })
         st.dataframe(show_df, use_container_width=True)
 
-        pivot_df = agent_activity.pivot_table(
-            index="activity_std",
-            columns="agent",
-            values="price",
-            aggfunc="sum",
-            fill_value=0
-        ).reset_index().rename(columns={"activity_std": "Activity"})
+        pivot_df = (
+            agent_activity.pivot_table(
+                index="activity_std",
+                columns="agent",
+                values="price",
+                aggfunc="sum",
+                fill_value=0
+            )
+            .reset_index()
+            .rename(columns={"activity_std": "Activity"})
+        )
         st.subheader("📊 Activity * 代理 费用透视表")
         st.dataframe(pivot_df, use_container_width=True)
 
@@ -1122,16 +1175,17 @@ def render_activity_tab(parsed):
         )
 
         with st.expander("查看未识别的 Activity 原始值"):
-            unmatched = (
-                activity_all_df[activity_all_df["activity_std"].isna()]["activity"]
-                .value_counts()
-                .reset_index()
-            )
-            if not unmatched.empty:
-                unmatched.columns = ["未识别Activity", "出现次数"]
-                st.dataframe(unmatched, use_container_width=True)
-            else:
-                st.success("所有 Activity 都已成功识别。")
+            if "activity_std" in activity_all_df.columns and "activity" in activity_all_df.columns:
+                unmatched = (
+                    activity_all_df[activity_all_df["activity_std"].isna()]["activity"]
+                    .value_counts()
+                    .reset_index()
+                )
+                if not unmatched.empty:
+                    unmatched.columns = ["未识别Activity", "出现次数"]
+                    st.dataframe(unmatched, use_container_width=True)
+                else:
+                    st.success("所有 Activity 都已成功识别。")
 
 
 def render_finance_tab(repairs_df_filtered, parsed):
@@ -1179,7 +1233,7 @@ def render_finance_tab(repairs_df_filtered, parsed):
 
     if parsed["template_name"] == "navee_service_report" and "labor_df" in parsed:
         labor_df = parsed["labor_df"].copy()
-        if not labor_df.empty:
+        if not labor_df.empty and {"labor_name", "labor_price"}.issubset(labor_df.columns):
             st.subheader("🧰 Labor 分析")
             labor_summary = (
                 labor_df.groupby("labor_name", dropna=False)["labor_price"]
@@ -1193,7 +1247,7 @@ def render_finance_tab(repairs_df_filtered, parsed):
 
 def render_orders_tab(parsed, sku_map_df):
     st.subheader("📦 订单 / 工单明细")
-    orders_df = parsed.get("orders_df", pd.DataFrame()).copy()
+    orders_df = parsed.get("orders_df", empty_df()).copy()
 
     if orders_df.empty:
         st.info("当前报告未识别到订单级明细。")
@@ -1203,7 +1257,10 @@ def render_orders_tab(parsed, sku_map_df):
         ow_df = orders_df.copy()
         if not ow_df.empty:
             ow_detail = attach_sku_name(ow_df.copy(), sku_map_df)
-            ow_detail["备件金额"] = ow_detail["unit_price"] if "unit_price" in ow_detail.columns else 0
+            if "unit_price" in ow_detail.columns:
+                ow_detail["备件金额"] = ow_detail["unit_price"]
+            else:
+                ow_detail["备件金额"] = 0
 
             st.subheader("OW 逐行明细")
             st.dataframe(ow_detail, use_container_width=True)
@@ -1221,7 +1278,6 @@ def render_orders_tab(parsed, sku_map_df):
                 )
                 st.subheader("按订单汇总（每个 Order ID 为一单）")
                 st.dataframe(ow_grouped, use_container_width=True)
-
     else:
         st.dataframe(orders_df, use_container_width=True)
 
@@ -1240,13 +1296,14 @@ def render_quality_tab(parsed, repairs_df_filtered, parts_df):
     }
     st.dataframe(pd.DataFrame(list(q.items()), columns=["检查项", "数量"]), use_container_width=True)
 
-    if not parts_df.empty:
+    if isinstance(parts_df, pd.DataFrame) and not parts_df.empty:
         with st.expander("查看缺失 SKU 的明细"):
-            bad_sku = parts_df[parts_df["SKU"].isna()] if "SKU" in parts_df.columns else pd.DataFrame()
-            st.dataframe(bad_sku, use_container_width=True)
+            if "SKU" in parts_df.columns:
+                bad_sku = parts_df[parts_df["SKU"].isna()]
+                st.dataframe(bad_sku, use_container_width=True)
 
-    activity_all_df = parsed.get("activity_all_df", pd.DataFrame())
-    if not activity_all_df.empty and "activity_std" in activity_all_df.columns:
+    activity_all_df = parsed.get("activity_all_df", empty_df())
+    if isinstance(activity_all_df, pd.DataFrame) and not activity_all_df.empty and "activity_std" in activity_all_df.columns:
         with st.expander("查看未识别 Activity 明细"):
             unmatched = activity_all_df[activity_all_df["activity_std"].isna()]
             st.dataframe(unmatched, use_container_width=True)
@@ -1258,10 +1315,10 @@ def render_export_tab(parsed, repairs_df_filtered, parts_df):
     export_files = {
         "repairs_filtered": repairs_df_filtered,
         "parts": parts_df,
-        "activity": parsed.get("activity_df", pd.DataFrame()),
-        "finance": parsed.get("finance_df", pd.DataFrame()),
-        "orders": parsed.get("orders_df", pd.DataFrame()),
-        "overview": parsed.get("overview_df", pd.DataFrame()),
+        "activity": parsed.get("activity_df", empty_df()),
+        "finance": parsed.get("finance_df", empty_df()),
+        "orders": parsed.get("orders_df", empty_df()),
+        "overview": parsed.get("overview_df", empty_df()),
     }
 
     st.download_button(
@@ -1309,8 +1366,8 @@ if report_file:
 
     render_header_info(parsed)
 
-    repairs_df = parsed.get("repairs_df", pd.DataFrame()).copy()
-    parts_df = parsed.get("parts_df", pd.DataFrame()).copy()
+    repairs_df = parsed.get("repairs_df", empty_df()).copy()
+    parts_df = parsed.get("parts_df", empty_df()).copy()
 
     if repairs_df.empty:
         st.warning("未解析出维修主表数据。")
@@ -1339,7 +1396,7 @@ if report_file:
         parts_filtered = parts_df.copy()
         if not parts_filtered.empty and "repair_id" in parts_filtered.columns and "repair_id" in repairs_df_filtered.columns:
             valid_ids = repairs_df_filtered["repair_id"].dropna().unique().tolist()
-            parts_filtered = parts_filtered[parts_filtered["repair_id"].isin(valid_ids)]
+            parts_filtered = parts_filtered[parts_filtered["repair_id"].isin(valid_ids)].copy()
         render_parts_tab(parts_filtered, sku_map_df)
 
     with tabs[3]:

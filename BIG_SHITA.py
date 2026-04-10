@@ -4,6 +4,7 @@ import numpy as np
 import altair as alt
 import re
 from io import BytesIO
+from datetime import timedelta
 
 st.set_page_config(page_title="维修分析（多Shit增强版）", layout="wide")
 st.title("🔧 维修分析（多shit增强版）")
@@ -52,6 +53,7 @@ def normalize_sku_value(x):
     if s.lower() in ["", "nan", "none", "null"]:
         return None
 
+    # 处理 12345.0 这种情况
     if re.fullmatch(r"\d+\.0", s):
         s = s[:-2]
 
@@ -94,14 +96,6 @@ def safe_ratio(series):
 # 模糊匹配函数
 # =============================
 def normalize_for_match(x):
-    """
-    做模糊匹配前统一清洗：
-    - 转字符串
-    - 去首尾空格
-    - 转小写
-    - 把 _, -, /, \ 替换为空格
-    - 压缩多余空格
-    """
     if pd.isna(x):
         return ""
     s = str(x).strip().lower()
@@ -111,9 +105,6 @@ def normalize_for_match(x):
 
 
 def contains_keyword_fuzzy(value, keywords):
-    """
-    只要文本中包含关键词，就算命中
-    """
     text = normalize_for_match(value)
     if text == "":
         return None
@@ -141,9 +132,6 @@ def map_agent_repair_report(sales_channel, model):
 
 
 def map_agent_additional_activity(client):
-    """
-    Additional Activity 的代理模糊归类
-    """
     client_keywords = ["CESV", "Carrefour", "Feuvert", "Conforama"]
     client_hit = contains_keyword_fuzzy(client, client_keywords)
     if client_hit:
@@ -152,15 +140,11 @@ def map_agent_additional_activity(client):
 
 
 def normalize_activity_name(activity):
-    """
-    Additional Activity 的 Activity 模糊识别标准化
-    """
     text = normalize_for_match(activity)
 
     if text == "":
         return None
 
-    # 1. COMUNICATION
     if (
         "comunication" in text or
         "communication" in text or
@@ -169,29 +153,24 @@ def normalize_activity_name(activity):
     ):
         return "COMUNICATION"
 
-    # 2. CALLS
     if "call" in text or "calls" in text:
         return "CALLS"
 
-    # 3. BOXES
     if "box" in text or "boxes" in text:
         return "BOXES"
 
-    # 4. WORTEN RECEPTION
     if (
         ("worten" in text and "reception" in text) or
         "worten reception" in text
     ):
         return "WORTEN RECEPTION"
 
-    # 5. BATTERY VOLTAGE CHECK
     if (
         ("battery" in text and "voltage" in text and "check" in text) or
         "battery voltage" in text
     ):
         return "BATTERY VOLTAGE CHECK"
 
-    # 6. DOAS Management
     if (
         ("doa" in text and "management" in text) or
         "doas management" in text or
@@ -199,7 +178,6 @@ def normalize_activity_name(activity):
     ):
         return "DOAS Management"
 
-    # 7. ANOVO Stock Transfer
     if (
         ("anovo" in text and "stock" in text and "transfer" in text) or
         "stock transfer" in text
@@ -207,6 +185,64 @@ def normalize_activity_name(activity):
         return "ANOVO Stock Transfer"
 
     return None
+
+
+# =============================
+# 表头自动识别
+# =============================
+def normalize_header_candidate(x):
+    if pd.isna(x):
+        return ""
+    s = str(x).strip().lower()
+    s = s.replace("\n", " ")
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def build_dataframe_with_detected_header(df_raw, expected_groups, scan_rows=30):
+    """
+    expected_groups: list[list[str]]
+    每个子列表表示“这一组任一字段命中即可”
+    """
+    if df_raw is None or df_raw.empty:
+        return pd.DataFrame()
+
+    temp = df_raw.copy().reset_index(drop=True)
+
+    header_idx = None
+    best_score = -1
+
+    max_scan = min(scan_rows, len(temp))
+
+    for i in range(max_scan):
+        row_vals = [normalize_header_candidate(v) for v in temp.iloc[i].tolist()]
+        row_set = set([v for v in row_vals if v != ""])
+
+        score = 0
+        for group in expected_groups:
+            if any(normalize_header_candidate(g) in row_set for g in group):
+                score += 1
+
+        if score > best_score:
+            best_score = score
+            header_idx = i
+
+    min_required = max(1, min(2, len(expected_groups)))
+    if best_score < min_required:
+        # 兜底：直接用第一行当表头
+        header_idx = 0
+
+    headers = [normalize_header_candidate(v) for v in temp.iloc[header_idx].tolist()]
+    headers = [
+        h if h != "" else f"unnamed_{idx}"
+        for idx, h in enumerate(headers)
+    ]
+
+    df = temp.iloc[header_idx + 1:].copy().reset_index(drop=True)
+    df.columns = headers
+    df = safe_columns(df)
+
+    return df
 
 
 # =============================
@@ -292,40 +328,37 @@ def load_workbook(uploaded_file):
     xls = pd.ExcelFile(uploaded_file)
     sheets = {}
     for s in xls.sheet_names:
-        sheets[s] = pd.read_excel(uploaded_file, sheet_name=s)
+        sheets[s] = pd.read_excel(uploaded_file, sheet_name=s, header=None)
     return sheets, xls.sheet_names
 
 
 def parse_overview_sheet(df_raw):
-    """
-    Übersicht 的真实表头可能不在第一行
-    尝试自动找到 Position / Quantity / Price 所在行
-    """
     if df_raw is None or df_raw.empty:
         return pd.DataFrame(columns=["position", "quantity", "price"])
 
-    df = df_raw.copy()
+    df = build_dataframe_with_detected_header(
+        df_raw,
+        expected_groups=[
+            ["position"],
+            ["quantity"],
+            ["price"]
+        ],
+        scan_rows=20
+    )
 
-    header_idx = None
-    for i in range(min(len(df), 10)):
-        row_vals = [str(x).strip().lower() for x in df.iloc[i].tolist()]
-        if "position" in row_vals and "quantity" in row_vals and "price" in row_vals:
-            header_idx = i
-            break
-
-    if header_idx is None:
-        df = df.iloc[:, :3].copy()
-        df.columns = ["position", "quantity", "price"]
-    else:
-        df.columns = [str(x).strip().lower() for x in df.iloc[header_idx].tolist()]
-        df = df.iloc[header_idx + 1:].copy()
-
-    df = safe_columns(df)
-    df = df.rename(columns={
+    rename_map = {
         "position": "position",
         "quantity": "quantity",
         "price": "price"
-    })
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    # 兜底：如果仍没有识别出，就取前三列
+    if "position" not in df.columns or "quantity" not in df.columns or "price" not in df.columns:
+        df = df.iloc[:, :3].copy()
+        while df.shape[1] < 3:
+            df[f"pad_{df.shape[1]}"] = None
+        df.columns = ["position", "quantity", "price"]
 
     for col in ["position", "quantity", "price"]:
         df = ensure_column(df, col)
@@ -339,8 +372,17 @@ def parse_overview_sheet(df_raw):
 
 
 def parse_repair_report(df_raw):
-    df = df_raw.copy()
-    df = safe_columns(df)
+    df = build_dataframe_with_detected_header(
+        df_raw,
+        expected_groups=[
+            ["repair order no.", "repair order", "repair id"],
+            ["date of receipt"],
+            ["date of shipment"],
+            ["model"],
+            ["sn"]
+        ],
+        scan_rows=30
+    )
 
     rename_map = {
         "repair order no.": "repair_id",
@@ -416,6 +458,12 @@ def parse_repair_report(df_raw):
     df["sn"] = df["sn"].fillna("").astype(str).str.strip()
     df["TAT"] = df.apply(calc_tat, axis=1)
 
+    # 去掉明显的空行
+    if "repair_id" in df.columns:
+        df = df[
+            ~(df["repair_id"].isna() & df["sn"].eq("") & df["model"].eq("未知"))
+        ].copy()
+
     df = df.sort_values(by=["sn", "received_date"], na_position="last")
     df["repeat"] = df.duplicated(subset=["sn"], keep="first")
 
@@ -428,8 +476,15 @@ def parse_repair_report(df_raw):
 
 
 def parse_additional_activity(df_raw):
-    df = df_raw.copy()
-    df = safe_columns(df)
+    df = build_dataframe_with_detected_header(
+        df_raw,
+        expected_groups=[
+            ["activity"],
+            ["client"],
+            ["price"]
+        ],
+        scan_rows=20
+    )
 
     rename_map = {
         "activity": "activity",
@@ -445,21 +500,26 @@ def parse_additional_activity(df_raw):
     df["client"] = normalize_text_series(df["client"])
     df["price"] = to_numeric_safe(df["price"], default=0)
 
-    # 代理模糊识别
     df["agent"] = df["client"].apply(map_agent_additional_activity)
-
-    # Activity 模糊识别并标准化
     df["activity_std"] = df["activity"].apply(normalize_activity_name)
 
-    # 只保留能识别到目标类目的数据
     filtered = df[df["activity_std"].notna()].copy()
 
     return df, filtered
 
 
 def parse_ow_sheet(df_raw):
-    df = df_raw.copy()
-    df = safe_columns(df)
+    df = build_dataframe_with_detected_header(
+        df_raw,
+        expected_groups=[
+            ["order id"],
+            ["model"],
+            ["sn"],
+            ["replaced sku", "replaced sku2", "replaced sku3"],
+            ["precio boom euros"]
+        ],
+        scan_rows=30
+    )
 
     rename_map = {
         "order id": "order_id",
@@ -525,7 +585,21 @@ if report_file:
 
     overview_df = parse_overview_sheet(overview_raw) if overview_raw is not None else pd.DataFrame()
     repair_df = parse_repair_report(repair_raw)
-    doa_df = doa_raw.copy() if doa_raw is not None else pd.DataFrame()
+
+    # DOA 仅展示原始数据，但也尝试自动识别表头，提高可读性
+    if doa_raw is not None and not doa_raw.empty:
+        doa_df = build_dataframe_with_detected_header(
+            doa_raw,
+            expected_groups=[
+                ["repair order no.", "repair order", "repair id"],
+                ["sn"],
+                ["model"]
+            ],
+            scan_rows=20
+        )
+    else:
+        doa_df = pd.DataFrame()
+
     add_all_df, add_filtered_df = parse_additional_activity(add_raw) if add_raw is not None else (pd.DataFrame(), pd.DataFrame())
     ow_df = parse_ow_sheet(ow_raw) if ow_raw is not None else pd.DataFrame()
 
@@ -544,9 +618,24 @@ if report_file:
     model_filter = st.sidebar.multiselect("Model", model_vals, default=model_vals)
     agent_filter = st.sidebar.multiselect("代理", agent_vals, default=agent_vals)
 
-    min_date = repair_df["received_date"].min() if repair_df["received_date"].notna().any() else pd.Timestamp.today()
-    max_date = repair_df["received_date"].max() if repair_df["received_date"].notna().any() else pd.Timestamp.today()
-    date_range = st.sidebar.date_input("日期范围", [min_date, max_date])
+    valid_received = repair_df["received_date"].dropna()
+
+    if not valid_received.empty:
+        min_date = valid_received.min().date()
+        max_date = valid_received.max().date()
+    else:
+        today = pd.Timestamp.today().date()
+        min_date = today
+        max_date = today
+
+    default_date_range = (min_date, max_date)
+
+    date_range = st.sidebar.date_input(
+        "日期范围",
+        value=default_date_range,
+        min_value=min_date,
+        max_value=max_date
+    )
 
     repair_filtered = repair_df.copy()
 
@@ -558,11 +647,37 @@ if report_file:
         repair_filtered = repair_filtered[repair_filtered["model"].isin(model_filter)]
     if agent_filter:
         repair_filtered = repair_filtered[repair_filtered["agent"].isin(agent_filter)]
-    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
-        repair_filtered = repair_filtered[
-            (repair_filtered["received_date"] >= pd.to_datetime(date_range[0])) &
-            (repair_filtered["received_date"] <= pd.to_datetime(date_range[1]))
-        ]
+
+    # 日期筛选修复：支持单日期 / 双日期，并统一按 date 比较
+    if valid_received.empty:
+        pass
+    else:
+        if isinstance(date_range, tuple):
+            if len(date_range) == 2:
+                start_date, end_date = date_range
+            elif len(date_range) == 1:
+                start_date = end_date = date_range[0]
+            else:
+                start_date, end_date = min_date, max_date
+        elif isinstance(date_range, list):
+            if len(date_range) == 2:
+                start_date, end_date = date_range
+            elif len(date_range) == 1:
+                start_date = end_date = date_range[0]
+            else:
+                start_date, end_date = min_date, max_date
+        else:
+            start_date = end_date = date_range
+
+        if start_date and end_date:
+            if start_date > end_date:
+                start_date, end_date = end_date, start_date
+
+            received_date_only = repair_filtered["received_date"].dt.date
+            repair_filtered = repair_filtered[
+                (received_date_only >= start_date) &
+                (received_date_only <= end_date)
+            ]
 
     tabs = st.tabs([
         "总览 Overview",
@@ -939,7 +1054,7 @@ if report_file:
                 else:
                     st.info("已识别到 Replaced SKU 相关字段，但这些列中没有有效SKU数据")
             else:
-                st.info("未识别到 Replaced SKU / Replaced SKU2 / Replaced SKU3 等字段，请检查表头是否在第一行")
+                st.info("未识别到 Replaced SKU / Replaced SKU2 / Replaced SKU3 等字段，请检查表头是否在第一行或表头命名是否异常")
 
             st.subheader("👨‍🔧 技术员表现")
             tech_perf = (

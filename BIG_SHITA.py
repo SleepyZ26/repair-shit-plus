@@ -375,7 +375,7 @@ def parse_repair_report(df_raw):
     df = build_dataframe_with_detected_header(
         df_raw,
         expected_groups=[
-            ["repair order no.", "repair order", "repair id"],
+            ["repair order no.", "repair order", "repair id", "order id"],
             ["date of receipt"],
             ["date of shipment"],
             ["model"],
@@ -385,9 +385,10 @@ def parse_repair_report(df_raw):
     )
 
     rename_map = {
-        "repair order no.": "repair_id",
-        "repair order": "repair_id",
-        "repair id": "repair_id",
+        "repair order no.": "repair_id_old",
+        "repair order": "repair_id_old",
+        "repair id": "repair_id_old",
+        "order id": "repair_id",
         "date of receipt": "received_date",
         "date of shipment": "shipment_date",
         "nation /state": "country",
@@ -398,7 +399,6 @@ def parse_repair_report(df_raw):
         "sales channal ": "sales_channel",
         "sales channel": "sales_channel",
         "customer name": "customer_name",
-        "order id": "order_id",
         "model": "model",
         "warranty status": "repair_type",
         "problem description by customer": "customer_issue",
@@ -417,12 +417,19 @@ def parse_repair_report(df_raw):
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
     for col in [
-        "repair_id", "received_date", "shipment_date", "country", "sales_channel",
-        "customer_name", "order_id", "model", "repair_type", "issue_desc",
+        "repair_id", "repair_id_old", "received_date", "shipment_date", "country", "sales_channel",
+        "customer_name", "model", "repair_type", "issue_desc",
         "technician", "sn", "repair_fee", "shipping_fee", "resend_shipping_fee",
         "scrap_fee", "other_fee"
     ]:
         df = ensure_column(df, col)
+
+    # repair_id 优先抓取 Order ID，若为空再回退旧 repair id
+    df["repair_id"] = df["repair_id"].fillna("").astype(str).str.strip()
+    df["repair_id_old"] = df["repair_id_old"].fillna("").astype(str).str.strip()
+    df["repair_id"] = df["repair_id"].replace("", np.nan)
+    df["repair_id"] = df["repair_id"].fillna(df["repair_id_old"])
+    df["repair_id"] = df["repair_id"].fillna("").astype(str).str.strip()
 
     df["received_date"] = pd.to_datetime(df["received_date"], errors="coerce")
     df["shipment_date"] = pd.to_datetime(df["shipment_date"], errors="coerce")
@@ -458,10 +465,9 @@ def parse_repair_report(df_raw):
     df["sn"] = df["sn"].fillna("").astype(str).str.strip()
     df["TAT"] = df.apply(calc_tat, axis=1)
 
-    # 去掉明显的空行
     if "repair_id" in df.columns:
         df = df[
-            ~(df["repair_id"].isna() & df["sn"].eq("") & df["model"].eq("未知"))
+            ~(df["repair_id"].eq("") & df["sn"].eq("") & df["model"].eq("未知"))
         ].copy()
 
     df = df.sort_values(by=["sn", "received_date"], na_position="last")
